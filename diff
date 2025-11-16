@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Generate an HTML diff report for two text files with navigation support."""
+from __future__ import annotations
+
+import argparse
+import difflib
+import html
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+
+def read_lines(path: Path, encoding: str) -> List[str]:
+    with path.open('r', encoding=encoding, errors='replace') as fh:
+        return fh.read().splitlines()
+
+
+def escape_line(text: str) -> str:
+    if text == "":
+        return "&nbsp;"
+    escaped = html.escape(text).replace("\t", "&nbsp;&nbsp;&nbsp;&nbsp;")
+    return escaped.replace(" ", "&nbsp;")
+
+
+def highlight_pair(left: str, right: str) -> Tuple[str, str]:
+    if left == right:
+        return escape_line(left), escape_line(right)
+    matcher = difflib.SequenceMatcher(None, left, right, autojunk=False)
+    left_parts: List[str] = []
+    right_parts: List[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        a = escape_line(left[i1:i2])
+        b = escape_line(right[j1:j2])
+        if tag == 'equal':
+            left_parts.append(a)
+            right_parts.append(b)
+        elif tag == 'delete':
+            left_parts.append(f"<span class='del'>{a}</span>")
+        elif tag == 'insert':
+            right_parts.append(f"<span class='ins'>{b}</span>")
+        elif tag == 'replace':
+            left_parts.append(f"<span class='rep'>{a}</span>")
+            right_parts.append(f"<span class='rep'>{b}</span>")
+    return ''.join(left_parts) or "&nbsp;", ''.join(right_parts) or "&nbsp;"
+
+
+def build_blocks(a: Sequence[str], b: Sequence[str]):
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    blocks = []
+    diff_meta = []
+    diff_index = 0
+    for tag, i1, i2, j1, j2 in opcodes:
+        anchor = None
+        if tag != 'equal':
+            diff_index += 1
+            anchor = f"diff-{diff_index}"
+            diff_meta.append({
+                'id': anchor,
+                'label': f"#{diff_index}: {tag} · A:{i1+1}-{i2} ↔ B:{j1+1}-{j2}"
+            })
+        blocks.append({
+            'tag': tag,
+            'i1': i1,
+            'i2': i2,
+            'j1': j1,
+            'j2': j2,
+            'anchor': anchor,
+        })
+    return blocks, diff_meta
+
+
+def write_report(file_a: Path, file_b: Path, output: Path, encoding: str):
+    left_lines = read_lines(file_a, encoding)
+    right_lines = read_lines(file_b, encoding)
+    blocks, diff_meta = build_blocks(left_lines, right_lines)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open('w', encoding='utf-8') as fh:
+        fh.write("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
+        fh.write("<meta charset='utf-8'>\n<title>Diff report</title>\n")
+        fh.write("""
+<style>
+body { font-family: 'Segoe UI', Roboto, sans-serif; margin: 0; }
+header { background: #0f172a; color: #fff; padding: 1rem 2rem; position: sticky; top: 0; z-index: 1000; display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
+h1 { margin: 0; font-size: 1.25rem; flex: 1 1 auto; }
+.nav-buttons { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+main { padding: 1rem 2rem 2rem; }
+.diff-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.diff-table th, .diff-table td { border: 1px solid #d2d6dc; padding: .2rem .4rem; vertical-align: top; }
+.diff-table th { background: #f3f4f6; position: sticky; top: 0; }
+.line-number { width: 4em; text-align: right; color: #6b7280; }
+.equal { background: #fff; }
+.insert { background: #ecfdf5; }
+.delete { background: #fef2f2; }
+.replace { background: #fff7ed; }
+span.ins { background: #a7f3d0; }
+span.del { background: #fecaca; }
+span.rep { background: #fed7aa; }
+.diff-summary { margin: 1rem 0; padding-left: 1.2rem; max-height: 240px; overflow:auto; }
+.diff-summary li { margin-bottom: .25rem; }
+.diff-summary a { color: #2563eb; text-decoration: none; }
+.diff-summary a:hover { text-decoration: underline; }
+tr[data-diff-anchor] { border-left: 6px solid #7c3aed; }
+nav button { background:#2563eb; border:none; color:#fff; padding:.4rem .8rem; border-radius:4px; cursor:pointer; }
+nav button:disabled { background:#9ca3af; cursor:not-allowed; }
+#nav-status { font-weight: 600; }
+pre { margin:0; font-family: 'JetBrains Mono', 'Fira Code', Menlo, monospace; }
+</style>\n""")
+        fh.write("""
+</head><body>
+<header>
+<h1>Diff for {}</h1>
+<nav class='nav-buttons'>
+<button onclick='goFirst()'>First</button>
+<button onclick='goPrev()'>Prev</button>
+<button onclick='goNext()'>Next</button>
+<button onclick='goLast()'>Last</button>
+<span id='nav-status'></span>
+</nav>
+</header>
+<main>
+<section>
+<h2>Summary ({count} differences)</h2>
+<ol class='diff-summary'>
+""".format(html.escape(f"{file_a.name} ⇄ {file_b.name}"), count=len(diff_meta)))
+        for item in diff_meta:
+            fh.write(f"<li><a href='# {item['id']}' onclick=\"jump('{item['id']}')\">{html.escape(item['label'])}</a></li>\n".replace('# ', '#'))
+        fh.write("</ol></section>\n<table class='diff-table'>\n")
+        fh.write("<thead><tr><th colspan='2'>{}</th><th colspan='2'>{}</th></tr>".format(html.escape(str(file_a)), html.escape(str(file_b))))
+        fh.write("<tr><th class='line-number'>#</th><th>Content</th><th class='line-number'>#</th><th>Content</th></tr></thead><tbody>\n")
+        for block in blocks:
+            tag = block['tag']
+            left_slice = left_lines[block['i1']:block['i2']]
+            right_slice = right_lines[block['j1']:block['j2']]
+            max_len = max(len(left_slice), len(right_slice)) or 1
+            for idx in range(max_len):
+                left_line = left_slice[idx] if idx < len(left_slice) else ""
+                right_line = right_slice[idx] if idx < len(right_slice) else ""
+                left_no = str(block['i1'] + idx + 1) if idx < len(left_slice) else ""
+                right_no = str(block['j1'] + idx + 1) if idx < len(right_slice) else ""
+                row_class = 'equal'
+                if tag == 'insert':
+                    row_class = 'insert'
+                elif tag == 'delete':
+                    row_class = 'delete'
+                elif tag == 'replace':
+                    row_class = 'replace'
+                anchor_attr = ""
+                if block['anchor'] and idx == 0:
+                    anchor_attr = f" id='{block['anchor']}' data-diff-anchor='true'"
+                fh.write(f"<tr class='{row_class}'{anchor_attr}>")
+                if tag == 'replace':
+                    left_html, right_html = highlight_pair(left_line, right_line)
+                elif tag == 'delete':
+                    left_html, right_html = f"<span class='del'>{escape_line(left_line)}</span>", "&nbsp;"
+                elif tag == 'insert':
+                    left_html, right_html = "&nbsp;", f"<span class='ins'>{escape_line(right_line)}</span>"
+                else:
+                    left_html = escape_line(left_line)
+                    right_html = escape_line(right_line)
+                fh.write(f"<td class='line-number'>{left_no}</td><td><pre>{left_html}</pre></td>")
+                fh.write(f"<td class='line-number'>{right_no}</td><td><pre>{right_html}</pre></td></tr>\n")
+        fh.write("</tbody></table></main>\n")
+        fh.write("""
+<script>
+const anchors = Array.from(document.querySelectorAll('[data-diff-anchor]'));
+let currentIndex = anchors.length ? 0 : -1;
+function scrollToIndex(idx){
+  if(idx < 0 || idx >= anchors.length) return;
+  currentIndex = idx;
+  anchors[idx].scrollIntoView({behavior: 'smooth', block: 'center'});
+  updateStatus();
+}
+function updateStatus(){
+  const label = anchors.length ? `Difference ${currentIndex+1}/${anchors.length}` : 'No differences';
+  document.getElementById('nav-status').textContent = label;
+}
+function goFirst(){ if(anchors.length) scrollToIndex(0); }
+function goLast(){ if(anchors.length) scrollToIndex(anchors.length-1); }
+function goNext(){ if(currentIndex+1 < anchors.length) scrollToIndex(currentIndex+1); }
+function goPrev(){ if(currentIndex-1 >=0) scrollToIndex(currentIndex-1); }
+function jump(id){
+  const target = anchors.findIndex(a => a.id === id);
+  if(target !== -1) scrollToIndex(target);
+}
+document.addEventListener('keydown', (evt) => {
+  if(evt.target.tagName === 'INPUT' || evt.target.tagName === 'TEXTAREA') return;
+  if(evt.key === 'ArrowRight') goNext();
+  if(evt.key === 'ArrowLeft') goPrev();
+});
+updateStatus();
+</script>
+</body></html>
+""")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate an HTML diff report for two text files")
+    parser.add_argument('file_a', type=Path)
+    parser.add_argument('file_b', type=Path)
+    parser.add_argument('-o', '--output', type=Path, default=Path('diff_report.html'), help='Output HTML file')
+    parser.add_argument('-e', '--encoding', default='utf-8', help='Encoding for input files (default: utf-8)')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    write_report(args.file_a, args.file_b, args.output, args.encoding)
+    print(f"Diff report written to {args.output}")
+
+
+if __name__ == '__main__':
+    main()
